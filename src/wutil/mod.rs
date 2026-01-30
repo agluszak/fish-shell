@@ -12,11 +12,10 @@ use crate::common::{
 };
 use crate::fds::BorrowedFdFile;
 use crate::flog;
-use errno::errno;
 use fish_wcstringutil::{join_strings, str2bytes_callback};
 use fish_widestring::{IntoCharIter, L, WExt, WString, wstr};
 use nix::unistd::AccessFlags;
-use std::ffi::{CStr, OsStr};
+use std::ffi::OsStr;
 use std::fs::{self, canonicalize};
 use std::io::{self, Write};
 use std::os::unix::prelude::*;
@@ -73,18 +72,15 @@ pub fn wperror(s: &wstr) {
 }
 
 /// Port of the wide-string wperror from `src/wutil.cpp` but for rust `&str`.
+/// Prints an error message based on the current errno value.
 pub fn perror(s: &str) {
-    let e = errno().0;
+    // Use Rust's idiomatic error handling instead of direct libc::strerror
+    let err = io::Error::last_os_error();
     let mut stderr = std::io::stderr().lock();
     if !s.is_empty() {
         let _ = write!(stderr, "{s}: ");
     }
-    let slice = unsafe {
-        let msg = libc::strerror(e);
-        CStr::from_ptr(msg).to_bytes()
-    };
-    let _ = stderr.write_all(slice);
-    let _ = stderr.write_all(b"\n");
+    let _ = writeln!(stderr, "{err}");
 }
 
 pub fn perror_io(s: &str, e: &io::Error) {

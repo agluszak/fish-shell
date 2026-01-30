@@ -127,17 +127,17 @@ use fish_wcstringutil::{
 };
 use fish_wcstringutil::{IsPrefix, is_prefix};
 use libc::{
-    _POSIX_VDISABLE, ECHO, EINTR, EIO, EISDIR, ENOTTY, EPERM, ESRCH, FLUSHO, ICANON, ICRNL, IEXTEN,
+    _POSIX_VDISABLE, ECHO, EIO, EINTR, EISDIR, ENOTTY, EPERM, FLUSHO, ICANON, ICRNL, IEXTEN,
     INLCR, IXOFF, IXON, O_NONBLOCK, ONLCR, OPOST, SIGINT, STDERR_FILENO, STDIN_FILENO,
     STDOUT_FILENO, TCSANOW, VMIN, VQUIT, VSUSP, VTIME, c_char,
 };
 use nix::{
     fcntl::OFlag,
     sys::{
-        signal::{Signal, killpg},
+        signal::{Signal, killpg, kill},
         stat::Mode,
     },
-    unistd::getpgrp,
+    unistd::{Pid, getpgrp},
 };
 use std::{
     borrow::Cow,
@@ -149,7 +149,7 @@ use std::{
     mem::MaybeUninit,
     num::NonZeroUsize,
     ops::{ControlFlow, Range},
-    os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     pin::Pin,
     sync::{
@@ -6256,8 +6256,12 @@ fn check_for_orphaned_process(loop_count: usize, shell_pgid: libc::pid_t) -> boo
     // Try kill-0'ing the process whose pid corresponds to our process group ID. It's possible this
     // will fail because we don't have permission to signal it. But more likely it will fail because
     // it no longer exists, and we are orphaned.
-    if loop_count % 64 == 0 && unsafe { libc::kill(shell_pgid, 0) } < 0 && errno().0 == ESRCH {
-        we_think_we_are_orphaned = true;
+    if loop_count % 64 == 0 {
+        // Use nix::sys::signal::kill with None signal (equivalent to kill(pid, 0))
+        let pid = Pid::from_raw(shell_pgid);
+        if let Err(nix::errno::Errno::ESRCH) = kill(pid, None) {
+            we_think_we_are_orphaned = true;
+        }
     }
 
     // Try reading from the tty; if we get EIO we are orphaned. This is sort of bad because it
@@ -6289,10 +6293,11 @@ fn check_for_orphaned_process(loop_count: usize, shell_pgid: libc::pid_t) -> boo
             }
         };
 
-        let mut tmp = 0 as libc::c_char;
-        if unsafe { libc::read(tty_fd.as_raw_fd(), (&raw mut tmp).cast(), 1) } < 0
-            && errno().0 == EIO
-        {
+        // Try reading from the tty; if we get EIO we are orphaned.
+        let mut tmp = [0u8; 1];
+        // Use nix::unistd::read which returns Result<usize>
+        // OwnedFd implements AsFd, so we can pass it directly
+        if let Err(nix::errno::Errno::EIO) = nix::unistd::read(tty_fd.as_fd(), &mut tmp) {
             we_think_we_are_orphaned = true;
         }
     }
