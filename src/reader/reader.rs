@@ -127,7 +127,7 @@ use fish_wcstringutil::{
 };
 use fish_wcstringutil::{IsPrefix, is_prefix};
 use libc::{
-    _POSIX_VDISABLE, ECHO, EIO, EINTR, EISDIR, ENOTTY, EPERM, FLUSHO, ICANON, ICRNL, IEXTEN,
+    _POSIX_VDISABLE, ECHO, EISDIR, ENOTTY, EPERM, FLUSHO, ICANON, ICRNL, IEXTEN,
     INLCR, IXOFF, IXON, O_NONBLOCK, ONLCR, OPOST, SIGINT, STDERR_FILENO, STDIN_FILENO,
     STDOUT_FILENO, TCSANOW, VMIN, VQUIT, VSUSP, VTIME, c_char,
 };
@@ -136,8 +136,9 @@ use nix::{
     sys::{
         signal::{Signal, killpg, kill},
         stat::Mode,
+        termios::{tcgetattr, tcsetattr, SetArg, Termios},
     },
-    unistd::{Pid, getpgrp},
+    unistd::{Pid, getpgrp, tcgetpgrp, tcsetpgrp},
 };
 use std::{
     borrow::Cow,
@@ -227,12 +228,13 @@ fn redirect_tty_after_sighup() {
     };
     let fd = devnull.as_raw_fd();
     for stdfd in [STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO] {
-        let mut t = std::mem::MaybeUninit::uninit();
-        unsafe {
-            if libc::tcgetattr(stdfd, t.as_mut_ptr()) != 0
-                && matches!(errno::errno().0, EIO | ENOTTY)
-            {
-                libc::dup2(fd, stdfd);
+        // Try to get terminal attributes; if it fails with EIO or ENOTTY, dup2 /dev/null
+        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(stdfd) };
+        if let Err(e) = tcgetattr(borrowed_fd) {
+            if matches!(e, nix::errno::Errno::EIO | nix::errno::Errno::ENOTTY) {
+                unsafe {
+                    libc::dup2(fd, stdfd);
+                }
             }
         }
     }
@@ -994,16 +996,17 @@ fn read_ni(parser: &Parser, fd: RawFd, io: &IoChain) -> Result<(), ErrorCode> {
 pub fn reader_init(will_restore_foreground_pgroup: bool) {
     // Save the initial terminal mode.
     // Note this field is read by a signal handler, so do it atomically, with a leaked mode.
-    let mut terminal_mode_on_startup = MaybeUninit::<libc::termios>::zeroed();
-    let ret = unsafe { libc::tcgetattr(libc::STDIN_FILENO, terminal_mode_on_startup.as_mut_ptr()) };
-    // TODO: rationalize behavior if initial tcgetattr() fails.
-    let terminal_mode_on_startup = if ret == 0 {
-        let modes = unsafe { terminal_mode_on_startup.assume_init() };
-        TERMINAL_MODE_ON_STARTUP.get_or_init(|| modes);
-        modes
-    } else {
-        // If tcgetattr fails, use zeroed modes as fallback
-        unsafe { MaybeUninit::zeroed().assume_init() }
+    let terminal_mode_on_startup = match tcgetattr(unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) }) {
+        Ok(modes) => {
+            // Convert nix::Termios to libc::termios for storage
+            let libc_modes: libc::termios = modes.into();
+            TERMINAL_MODE_ON_STARTUP.get_or_init(|| libc_modes);
+            libc_modes
+        }
+        Err(_) => {
+            // If tcgetattr fails, use zeroed modes as fallback
+            unsafe { MaybeUninit::zeroed().assume_init() }
+        }
     };
 
     if !cfg!(test) {
@@ -1031,8 +1034,12 @@ pub fn reader_init(will_restore_foreground_pgroup: bool) {
 
     // Set up our fixed terminal modes once,
     // so we don't get flow control just because we inherited it.
-    if is_interactive_session() && getpgrp().as_raw() == unsafe { libc::tcgetpgrp(STDIN_FILENO) } {
-        term_donate(/*quiet=*/ true);
+    if is_interactive_session() {
+        if let Ok(pgrp) = tcgetpgrp(unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) }) {
+            if getpgrp() == pgrp {
+                term_donate(/*quiet=*/ true);
+            }
+        }
     }
 }
 
@@ -1048,6 +1055,7 @@ pub fn reader_deinit(restore_foreground_pgroup: bool) {
 /// It's important we do this before restore_foreground_process_group,
 /// otherwise we won't think we own the terminal.
 /// THIS FUNCTION IS CALLED FROM A SIGNAL HANDLER. IT MUST BE ASYNC-SIGNAL-SAFE.
+/// Therefore we use raw libc calls instead of nix wrappers.
 pub fn safe_restore_term_mode() {
     if !is_interactive_session() || getpgrp().as_raw() != unsafe { libc::tcgetpgrp(STDIN_FILENO) } {
         return;
@@ -2642,7 +2650,9 @@ impl<'a> Reader<'a> {
             // The order of the two conditions below is important. Try to restore the mode
             // in all cases, but only complain if interactive.
             if let Some(old_modes) = old_modes {
-                if unsafe { libc::tcsetattr(self.conf.inputfd, TCSANOW, &old_modes) } == -1
+                // Convert libc::termios to nix::Termios for tcsetattr
+                let nix_modes = Termios::from(old_modes);
+                if tcsetattr(unsafe { BorrowedFd::borrow_raw(self.conf.inputfd) }, SetArg::TCSANOW, &nix_modes).is_err()
                     && is_interactive_session()
                 {
                     perror("tcsetattr");
@@ -4759,57 +4769,59 @@ fn term_fix_external_modes(modes: &mut libc::termios) {
 
 /// Give up control of terminal.
 fn term_donate(quiet: bool /* = false */) {
-    while unsafe {
-        libc::tcsetattr(
-            STDIN_FILENO,
-            TCSANOW,
-            &*TTY_MODES_FOR_EXTERNAL_CMDS.lock().unwrap(),
-        )
-    } == -1
-    {
-        if errno().0 != EINTR {
-            if !quiet {
-                flog!(
-                    warning,
-                    wgettext!("Could not set terminal mode for new job")
-                );
-                perror("tcsetattr");
+    loop {
+        let modes = TTY_MODES_FOR_EXTERNAL_CMDS.lock().unwrap();
+        let nix_modes = Termios::from(*modes);
+        match tcsetattr(unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) }, SetArg::TCSANOW, &nix_modes) {
+            Ok(()) => break,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => {
+                if !quiet {
+                    flog!(
+                        warning,
+                        wgettext!("Could not set terminal mode for new job")
+                    );
+                    perror("tcsetattr");
+                }
+                break;
             }
-            break;
         }
     }
 }
 
 /// Copy the (potentially changed) terminal modes and use them from now on.
 pub fn term_copy_modes() {
-    let mut modes = MaybeUninit::uninit();
-    unsafe { libc::tcgetattr(STDIN_FILENO, modes.as_mut_ptr()) };
-    let mut tty_modes_for_external_cmds = TTY_MODES_FOR_EXTERNAL_CMDS.lock().unwrap();
-    *tty_modes_for_external_cmds = unsafe { modes.assume_init() };
-    // We still want to fix most egregious breakage.
-    // E.g. OPOST is *not* something that should be set globally,
-    // and 99% triggered by a crashed program.
-    term_fix_external_modes(&mut tty_modes_for_external_cmds);
+    if let Ok(modes) = tcgetattr(unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) }) {
+        let libc_modes: libc::termios = modes.into();
+        let mut tty_modes_for_external_cmds = TTY_MODES_FOR_EXTERNAL_CMDS.lock().unwrap();
+        *tty_modes_for_external_cmds = libc_modes;
+        // We still want to fix most egregious breakage.
+        // E.g. OPOST is *not* something that should be set globally,
+        // and 99% triggered by a crashed program.
+        term_fix_external_modes(&mut tty_modes_for_external_cmds);
 
-    let mut shell_modes = shell_modes();
-    // Copy flow control settings to shell modes.
-    if (tty_modes_for_external_cmds.c_iflag & IXON) != 0 {
-        shell_modes.c_iflag |= IXON;
-    } else {
-        shell_modes.c_iflag &= !IXON;
-    }
-    if (tty_modes_for_external_cmds.c_iflag & IXOFF) != 0 {
-        shell_modes.c_iflag |= IXOFF;
-    } else {
-        shell_modes.c_iflag &= !IXOFF;
+        let mut shell_modes = shell_modes();
+        // Copy flow control settings to shell modes.
+        if (tty_modes_for_external_cmds.c_iflag & IXON) != 0 {
+            shell_modes.c_iflag |= IXON;
+        } else {
+            shell_modes.c_iflag &= !IXON;
+        }
+        if (tty_modes_for_external_cmds.c_iflag & IXOFF) != 0 {
+            shell_modes.c_iflag |= IXOFF;
+        } else {
+            shell_modes.c_iflag &= !IXOFF;
+        }
     }
 }
 
 pub fn set_shell_modes(fd: RawFd, whence: &str) -> bool {
     let ok = loop {
-        let ok = unsafe { libc::tcsetattr(fd, TCSANOW, &*shell_modes()) } != -1;
-        if ok || errno().0 != EINTR {
-            break ok;
+        let nix_modes = Termios::from(*shell_modes());
+        match tcsetattr(unsafe { BorrowedFd::borrow_raw(fd) }, SetArg::TCSANOW, &nix_modes) {
+            Ok(()) => break true,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => break false,
         }
     };
     if !ok {
@@ -4826,14 +4838,10 @@ pub fn set_shell_modes_temporarily(inputfd: RawFd) -> Option<libc::termios> {
     // It may happen that a command we ran when job control was disabled nevertheless stole the tty
     // from us. In that case when we read from our fd, it will trigger SIGTTIN. So just
     // unconditionally reclaim the tty. See #9181.
-    unsafe { libc::tcsetpgrp(inputfd, libc::getpgrp()) };
+    let _ = tcsetpgrp(unsafe { BorrowedFd::borrow_raw(inputfd) }, getpgrp());
 
     // Get the current terminal modes. These will be restored when the function returns.
-    let old_modes = {
-        let mut old_modes = MaybeUninit::uninit();
-        let ok = unsafe { libc::tcgetattr(inputfd, old_modes.as_mut_ptr()) } == 0;
-        ok.then(|| unsafe { old_modes.assume_init() })
-    };
+    let old_modes = tcgetattr(unsafe { BorrowedFd::borrow_raw(inputfd) }).ok().map(|modes| modes.into());
 
     // Set the new modes.
     set_shell_modes(inputfd, "readline");
@@ -4858,7 +4866,7 @@ fn acquire_tty_or_exit(shell_pgid: libc::pid_t) {
     // Check if we are in control of the terminal, so that we don't do semi-expensive things like
     // reset signal handlers unless we really have to, which we often don't.
     // Common case.
-    let mut owner = unsafe { libc::tcgetpgrp(STDIN_FILENO) };
+    let mut owner = tcgetpgrp(unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) }).map(|p| p.as_raw()).unwrap_or(-1);
     if owner == shell_pgid {
         return;
     }
@@ -4890,17 +4898,17 @@ fn acquire_tty_or_exit(shell_pgid: libc::pid_t) {
     // harder, because it may succeed or block. So we loop for a while, trying those strategies.
     // Eventually we just give up and assume we're orphaend.
     for loop_count in 0.. {
-        owner = unsafe { libc::tcgetpgrp(STDIN_FILENO) };
+        owner = tcgetpgrp(unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) }).map(|p| p.as_raw()).unwrap_or(-1);
         // 0 is a valid return code from `tcgetpgrp()` under at least FreeBSD and testing
         // indicates that a subsequent call to `tcsetpgrp()` will succeed. 0 is the
         // pid of the top-level kernel process, so I'm not sure if this means ownership
         // of the terminal has gone back to the kernel (i.e. it's not owned) or if it is
         // just an "invalid" pid for all intents and purposes.
         if owner == 0 {
-            unsafe { libc::tcsetpgrp(STDIN_FILENO, shell_pgid) };
+            let _ = tcsetpgrp(unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) }, Pid::from_raw(shell_pgid));
             // Since we expect the above to work, call `tcgetpgrp()` immediately to
             // avoid a second pass through this loop.
-            owner = unsafe { libc::tcgetpgrp(STDIN_FILENO) };
+            owner = tcgetpgrp(unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) }).map(|p| p.as_raw()).unwrap_or(-1);
         }
         if owner == -1 && errno().0 == ENOTTY {
             if !is_interactive_session() {
@@ -4974,9 +4982,9 @@ fn reader_interactive_init() {
         }
 
         // Take control of the terminal
-        if unsafe { libc::tcsetpgrp(STDIN_FILENO, shell_pgid) } == -1 {
+        if let Err(e) = tcsetpgrp(unsafe { BorrowedFd::borrow_raw(STDIN_FILENO) }, Pid::from_raw(shell_pgid)) {
             flog!(error, wgettext!("Failed to take control of the terminal"));
-            perror("tcsetpgrp");
+            flog!(error, format!("tcsetpgrp: {}", e));
             exit_without_destructors(1);
         }
 
