@@ -128,7 +128,7 @@ use fish_wcstringutil::{
 use fish_wcstringutil::{IsPrefix, is_prefix};
 use libc::{
     _POSIX_VDISABLE, ECHO, EINTR, EIO, EISDIR, ENOTTY, EPERM, ESRCH, FLUSHO, ICANON, ICRNL, IEXTEN,
-    INLCR, IXOFF, IXON, O_NONBLOCK, O_RDONLY, ONLCR, OPOST, SIGINT, STDERR_FILENO, STDIN_FILENO,
+    INLCR, IXOFF, IXON, O_NONBLOCK, ONLCR, OPOST, SIGINT, STDERR_FILENO, STDIN_FILENO,
     STDOUT_FILENO, TCSANOW, VMIN, VQUIT, VSUSP, VTIME, c_char,
 };
 use nix::{
@@ -143,11 +143,14 @@ use std::{
     borrow::Cow,
     cell::UnsafeCell,
     cmp,
+    ffi::{CStr, OsStr},
+    fs::OpenOptions,
     io::BufReader,
     mem::MaybeUninit,
     num::NonZeroUsize,
     ops::{ControlFlow, Range},
-    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     pin::Pin,
     sync::{
         Arc, LazyLock, Mutex, MutexGuard, OnceLock,
@@ -6271,12 +6274,19 @@ fn check_for_orphaned_process(loop_count: usize, shell_pgid: libc::pid_t) -> boo
 
         // Open the tty. Presumably this is stdin, but maybe not?
         let tty_fd = {
-            let res = unsafe { libc::open(tty, O_RDONLY | O_NONBLOCK) };
-            if res < 0 {
-                perror("open");
-                exit_without_destructors(1);
+            let tty_path = unsafe { CStr::from_ptr(tty) };
+            let tty_osstr = OsStr::from_bytes(tty_path.to_bytes());
+            match OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NONBLOCK)
+                .open(tty_osstr)
+            {
+                Ok(file) => unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) },
+                Err(_) => {
+                    perror("open");
+                    exit_without_destructors(1);
+                }
             }
-            unsafe { OwnedFd::from_raw_fd(res) }
         };
 
         let mut tmp = 0 as libc::c_char;
