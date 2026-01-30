@@ -174,7 +174,7 @@ enum ExitState {
 static EXIT_STATE: AtomicU8 = AtomicU8::new(ExitState::None as u8);
 
 pub static SHELL_MODES: LazyLock<Mutex<libc::termios>> =
-    LazyLock::new(|| Mutex::new(unsafe { std::mem::zeroed() }));
+    LazyLock::new(|| Mutex::new(unsafe { MaybeUninit::zeroed().assume_init() }));
 
 /// The valid terminal modes on startup.
 /// Warning: this is read from the SIGTERM handler! Hence the raw global.
@@ -182,7 +182,7 @@ static TERMINAL_MODE_ON_STARTUP: OnceLock<libc::termios> = OnceLock::new();
 
 /// Mode we use to execute programs.
 static TTY_MODES_FOR_EXTERNAL_CMDS: LazyLock<Mutex<libc::termios>> =
-    LazyLock::new(|| Mutex::new(unsafe { std::mem::zeroed() }));
+    LazyLock::new(|| Mutex::new(unsafe { MaybeUninit::zeroed().assume_init() }));
 
 static RUN_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -994,12 +994,17 @@ fn read_ni(parser: &Parser, fd: RawFd, io: &IoChain) -> Result<(), ErrorCode> {
 pub fn reader_init(will_restore_foreground_pgroup: bool) {
     // Save the initial terminal mode.
     // Note this field is read by a signal handler, so do it atomically, with a leaked mode.
-    let mut terminal_mode_on_startup = unsafe { std::mem::zeroed::<libc::termios>() };
-    let ret = unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut terminal_mode_on_startup) };
+    let mut terminal_mode_on_startup = MaybeUninit::<libc::termios>::zeroed();
+    let ret = unsafe { libc::tcgetattr(libc::STDIN_FILENO, terminal_mode_on_startup.as_mut_ptr()) };
     // TODO: rationalize behavior if initial tcgetattr() fails.
-    if ret == 0 {
-        TERMINAL_MODE_ON_STARTUP.get_or_init(|| terminal_mode_on_startup);
-    }
+    let terminal_mode_on_startup = if ret == 0 {
+        let modes = unsafe { terminal_mode_on_startup.assume_init() };
+        TERMINAL_MODE_ON_STARTUP.get_or_init(|| modes);
+        modes
+    } else {
+        // If tcgetattr fails, use zeroed modes as fallback
+        unsafe { MaybeUninit::zeroed().assume_init() }
+    };
 
     if !cfg!(test) {
         assert!(AT_EXIT.get().is_none());
