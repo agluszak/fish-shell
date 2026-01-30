@@ -152,7 +152,7 @@ fn setup_and_process_keys(
 ) -> BuiltinResult {
     // We need to set the shell-modes for ICRNL,
     // in fish-proper this is done once a command is run.
-    set_shell_modes(STDIN_FILENO, "fish_key_reader");
+    set_shell_modes(unsafe { std::os::fd::BorrowedFd::borrow_raw(STDIN_FILENO) }, "fish_key_reader");
 
     if continuous_mode {
         streams.err.append(L!("\n"));
@@ -325,7 +325,7 @@ fn throwing_main() -> i32 {
         let vars = EnvStack::new();
         env_stack_set_from_env!(vars, "STY");
         env_stack_set_from_env!(vars, "TERM");
-        terminal_init(&vars, STDIN_FILENO).input_queue
+        terminal_init(&vars, unsafe { std::os::fd::BorrowedFd::borrow_raw(STDIN_FILENO) }).input_queue
     };
 
     setup_and_process_keys(&mut streams, continuous_mode, verbose, input_queue)

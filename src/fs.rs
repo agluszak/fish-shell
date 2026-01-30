@@ -14,6 +14,7 @@ use nix::{fcntl::OFlag, sys::stat::Mode};
 use std::{
     ffi::OsString,
     fs::{File, OpenOptions},
+    mem::MaybeUninit,
     os::{
         fd::AsRawFd,
         unix::{ffi::OsStringExt, fs::MetadataExt},
@@ -327,7 +328,7 @@ where
         // only be updated once every 10 milliseconds.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            let mut times: [libc::timespec; 2] = unsafe { std::mem::zeroed() };
+            let mut times: [libc::timespec; 2] = unsafe { MaybeUninit::zeroed().assume_init() };
             times[0].tv_nsec = libc::UTIME_OMIT; // don't change atime
             if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut times[1]) } == 0 {
                 unsafe {
