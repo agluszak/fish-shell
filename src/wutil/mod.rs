@@ -74,7 +74,6 @@ pub fn wperror(s: &wstr) {
 /// Port of the wide-string wperror from `src/wutil.cpp` but for rust `&str`.
 /// Prints an error message based on the current errno value.
 pub fn perror(s: &str) {
-    // Use Rust's idiomatic error handling instead of direct libc::strerror
     let err = io::Error::last_os_error();
     let mut stderr = std::io::stderr().lock();
     if !s.is_empty() {
