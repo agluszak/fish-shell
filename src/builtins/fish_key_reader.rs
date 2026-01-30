@@ -152,7 +152,7 @@ fn setup_and_process_keys(
 ) -> BuiltinResult {
     // We need to set the shell-modes for ICRNL,
     // in fish-proper this is done once a command is run.
-    set_shell_modes(STDIN_FILENO, "fish_key_reader");
+    set_shell_modes(unsafe { std::os::fd::BorrowedFd::borrow_raw(STDIN_FILENO) }, "fish_key_reader");
 
     if continuous_mode {
         streams.err.append(L!("\n"));

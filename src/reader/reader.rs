@@ -68,7 +68,7 @@ use crate::input_common::{
 use crate::io::IoChain;
 use crate::key::ViewportPosition;
 use crate::kill::{kill_add, kill_replace, kill_yank, kill_yank_rotate};
-use crate::nix::{getpid, isatty};
+use crate::nix::isatty;
 use crate::operation_context::{OperationContext, get_bg_context};
 use crate::pager::{PageRendering, Pager, SelectionMotion};
 use crate::panic::AT_EXIT;
@@ -138,7 +138,7 @@ use nix::{
         stat::Mode,
         termios::{tcgetattr, tcsetattr, SetArg, Termios},
     },
-    unistd::{Pid, getpgrp, setpgid, tcgetpgrp, tcsetpgrp},
+    unistd::{Pid, getpgrp, getpid, setpgid, tcgetpgrp, tcsetpgrp},
 };
 use std::{
     borrow::Cow,
@@ -150,7 +150,7 @@ use std::{
     mem::MaybeUninit,
     num::NonZeroUsize,
     ops::{ControlFlow, Range},
-    os::fd::{AsRawFd, BorrowedFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::PathBuf,
     pin::Pin,
@@ -303,7 +303,7 @@ pub fn terminal_init(vars: &dyn Environment, inputfd: RawFd) -> TerminalInitResu
         };
     }
 
-    set_shell_modes(inputfd, "initial query");
+    set_shell_modes(unsafe { BorrowedFd::borrow_raw(inputfd) }, "initial query");
     {
         let mut out = BufferedOutputter::new(Outputter::stdoutput());
         // Query for kitty keyboard protocol support.
@@ -835,7 +835,7 @@ pub fn reader_read(parser: &Parser, fd: RawFd, io: &IoChain) -> Result<(), Error
         read_i(parser);
         Ok(())
     } else {
-        read_ni(parser, fd, io)
+        read_ni(parser, unsafe { BorrowedFd::borrow_raw(fd) }, io)
     };
 
     // If the exit command was called in a script, only exit the script, not the program.
@@ -944,8 +944,8 @@ fn read_i(parser: &Parser) {
 /// Read non-interactively.  Read input from stdin without displaying the prompt, using syntax
 /// highlighting. This is used for reading scripts and init files.
 /// The file is not closed.
-fn read_ni(parser: &Parser, fd: RawFd, io: &IoChain) -> Result<(), ErrorCode> {
-    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+fn read_ni(parser: &Parser, fd: impl AsFd, io: &IoChain) -> Result<(), ErrorCode> {
+    let fd = fd.as_fd();
     let md = match fstat(fd) {
         Ok(md) => md,
         Err(err) => {
@@ -2716,7 +2716,7 @@ impl<'a> Reader<'a> {
         // from a key binding. However we do NOT want to invoke term_donate(), because that will enable
         // ECHO mode, causing a race between new input and restoring the mode (#7770). So we leave the
         // tty alone, run the commands in shell mode, and then restore shell modes.
-        set_shell_modes(STDIN_FILENO, "bind scripts");
+        set_shell_modes(stdin_fd(), "bind scripts");
         safe_termsize_invalidate_tty();
     }
 
@@ -4844,8 +4844,8 @@ pub fn term_copy_modes() {
     }
 }
 
-pub fn set_shell_modes(fd: RawFd, whence: &str) -> bool {
-    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+pub fn set_shell_modes(fd: impl AsFd, whence: &str) -> bool {
+    let fd = fd.as_fd();
     let ok = loop {
         let nix_modes = Termios::from(*shell_modes());
         match tcsetattr(fd, SetArg::TCSANOW, &nix_modes) {
@@ -4875,7 +4875,7 @@ pub fn set_shell_modes_temporarily(inputfd: RawFd) -> Option<libc::termios> {
     let old_modes = tcgetattr(fd).ok().map(|modes| modes.into());
 
     // Set the new modes.
-    set_shell_modes(inputfd, "readline");
+    set_shell_modes(fd, "readline");
 
     old_modes
 }
@@ -4885,7 +4885,7 @@ fn term_steal(copy_modes: bool) {
     if copy_modes {
         term_copy_modes();
     }
-    set_shell_modes(STDIN_FILENO, "shell");
+    set_shell_modes(stdin_fd(), "shell");
     safe_termsize_invalidate_tty();
 }
 
@@ -4905,7 +4905,7 @@ fn acquire_tty_or_exit(shell_pgid: Pid) {
     // In some strange cases the tty may be come preassigned to fish's pid, but not its pgroup.
     // In that case we simply attempt to claim our own pgroup.
     // See #7388.
-    if owner == Pid::from_raw(getpid()) {
+    if owner == getpid() {
         let _ = setpgid(owner, owner);
         return;
     }
@@ -4965,7 +4965,7 @@ fn acquire_tty_or_exit(shell_pgid: Pid) {
                     warning,
                     sprintf!(
                         "I appear to be an orphaned process, so I am quitting politely. My pid is %d.",
-                        pid
+                        pid.as_raw()
                     )
                 );
                 exit_without_destructors(1);
@@ -4985,7 +4985,7 @@ fn reader_interactive_init() {
     assert_is_main_thread();
 
     let mut shell_pgid = getpgrp();
-    let shell_pid = Pid::from_raw(getpid());
+    let shell_pid = getpid();
 
     // Ensure interactive signal handling is enabled.
     signal_set_handlers_once(true);
@@ -5020,7 +5020,7 @@ fn reader_interactive_init() {
         }
 
         // Configure terminal attributes
-        set_shell_modes(STDIN_FILENO, "startup");
+        set_shell_modes(stdin_fd(), "startup");
     }
 
     safe_termsize_invalidate_tty();
