@@ -116,7 +116,6 @@ use crate::wildcard::wildcard_has;
 use crate::wutil::{fstat, perror, write_to_fd, wstat};
 use crate::{abbrs, event, function};
 use assert_matches::assert_matches;
-use errno::{Errno, errno};
 use fish_common::{UTF8_BOM_WCHAR, help_section};
 use fish_fallback::fish_wcwidth;
 use fish_fallback::lowercase;
@@ -127,7 +126,7 @@ use fish_wcstringutil::{
 };
 use fish_wcstringutil::{IsPrefix, is_prefix};
 use libc::{
-    _POSIX_VDISABLE, ECHO, EISDIR, ENOTTY, FLUSHO, ICANON, ICRNL, IEXTEN,
+    _POSIX_VDISABLE, ECHO, EISDIR, FLUSHO, ICANON, ICRNL, IEXTEN,
     INLCR, IXOFF, IXON, O_NONBLOCK, ONLCR, OPOST, SIGINT, STDERR_FILENO, STDIN_FILENO,
     STDOUT_FILENO, TCSANOW, VMIN, VQUIT, VSUSP, VTIME, c_char,
 };
@@ -285,11 +284,13 @@ pub struct TerminalInitResult {
     pub background_color: Option<xterm_color::Color>,
 }
 
-pub fn terminal_init(vars: &dyn Environment, inputfd: RawFd) -> TerminalInitResult {
-    assert!(isatty(inputfd));
+pub fn terminal_init(vars: &dyn Environment, inputfd: impl AsFd) -> TerminalInitResult {
+    let inputfd = inputfd.as_fd();
+    let inputfd_raw = inputfd.as_raw_fd();
+    assert!(isatty(inputfd_raw));
     reader_interactive_init();
 
-    let mut input_queue = InputEventQueue::new(inputfd, Some(LONG_READ_TIMEOUT));
+    let mut input_queue = InputEventQueue::new(inputfd_raw, Some(LONG_READ_TIMEOUT));
     let mut background_color = None;
 
     let _init_tty_metadata = ScopeGuard::new((), |()| {
@@ -303,7 +304,7 @@ pub fn terminal_init(vars: &dyn Environment, inputfd: RawFd) -> TerminalInitResu
         };
     }
 
-    set_shell_modes(unsafe { BorrowedFd::borrow_raw(inputfd) }, "initial query");
+    set_shell_modes(inputfd, "initial query");
     {
         let mut out = BufferedOutputter::new(Outputter::stdoutput());
         // Query for kitty keyboard protocol support.
@@ -413,7 +414,7 @@ pub fn reader_push<'a>(parser: &'a Parser, history_name: &wstr, conf: ReaderConf
         let TerminalInitResult {
             mut input_queue,
             background_color,
-        } = terminal_init(parser.vars(), inputfd);
+        } = terminal_init(parser.vars(), unsafe { BorrowedFd::borrow_raw(inputfd) });
         let input_data = input_queue.get_input_data_mut();
         guess_emoji_width(parser.vars());
 
@@ -963,7 +964,8 @@ fn read_ni(parser: &Parser, fd: impl AsFd, io: &IoChain) -> Result<(), ErrorCode
     if fd.as_raw_fd() != STDIN_FILENO && md.is_dir() {
         flog!(
             error,
-            wgettext_fmt!("Unable to read input file: %s", Errno(EISDIR).to_string())
+            wgettext_fmt!("Unable to read input file: %s", 
+                std::io::Error::from_raw_os_error(EISDIR).to_string())
         );
         return Err(STATUS_CMD_ERROR);
     }
@@ -4897,7 +4899,9 @@ fn acquire_tty_or_exit(shell_pgid: Pid) {
     // Check if we are in control of the terminal, so that we don't do semi-expensive things like
     // reset signal handlers unless we really have to, which we often don't.
     // Common case.
-    let mut owner = tcgetpgrp(stdin_fd()).unwrap_or(Pid::from_raw(-1));
+    let Some(mut owner) = tcgetpgrp(stdin_fd()).ok() else {
+        return;
+    };
     if owner == shell_pgid {
         return;
     }
@@ -4929,19 +4933,10 @@ fn acquire_tty_or_exit(shell_pgid: Pid) {
     // harder, because it may succeed or block. So we loop for a while, trying those strategies.
     // Eventually we just give up and assume we're orphaend.
     for loop_count in 0.. {
-        owner = tcgetpgrp(stdin_fd()).unwrap_or(Pid::from_raw(-1));
-        // 0 is a valid return code from `tcgetpgrp()` under at least FreeBSD and testing
-        // indicates that a subsequent call to `tcsetpgrp()` will succeed. 0 is the
-        // pid of the top-level kernel process, so I'm not sure if this means ownership
-        // of the terminal has gone back to the kernel (i.e. it's not owned) or if it is
-        // just an "invalid" pid for all intents and purposes.
-        if owner == Pid::from_raw(0) {
-            let _ = tcsetpgrp(stdin_fd(), shell_pgid);
-            // Since we expect the above to work, call `tcgetpgrp()` immediately to
-            // avoid a second pass through this loop.
-            owner = tcgetpgrp(stdin_fd()).unwrap_or(Pid::from_raw(-1));
-        }
-        if owner == Pid::from_raw(-1) && errno().0 == ENOTTY {
+        let owner_result = tcgetpgrp(stdin_fd());
+        
+        // Check for ENOTTY error
+        if let Err(nix::errno::Errno::ENOTTY) = owner_result {
             if !is_interactive_session() {
                 // It's OK if we're not able to take control of the terminal. We handle
                 // the fallout from this in a few other places.
@@ -4954,6 +4949,26 @@ fn acquire_tty_or_exit(shell_pgid: Pid) {
             );
             perror("setpgid");
             exit_without_destructors(1);
+        }
+        
+        // Get owner or continue if error (other than ENOTTY)
+        let Some(owner_pid) = owner_result.ok() else {
+            continue;
+        };
+        owner = owner_pid;
+        
+        // 0 is a valid return code from `tcgetpgrp()` under at least FreeBSD and testing
+        // indicates that a subsequent call to `tcsetpgrp()` will succeed. 0 is the
+        // pid of the top-level kernel process, so I'm not sure if this means ownership
+        // of the terminal has gone back to the kernel (i.e. it's not owned) or if it is
+        // just an "invalid" pid for all intents and purposes.
+        if owner == Pid::from_raw(0) {
+            let _ = tcsetpgrp(stdin_fd(), shell_pgid);
+            // Since we expect the above to work, call `tcgetpgrp()` immediately to
+            // avoid a second pass through this loop.
+            if let Ok(new_owner) = tcgetpgrp(stdin_fd()) {
+                owner = new_owner;
+            }
         }
         if owner == shell_pgid {
             break; // success

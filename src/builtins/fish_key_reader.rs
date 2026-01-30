@@ -325,7 +325,7 @@ fn throwing_main() -> i32 {
         let vars = EnvStack::new();
         env_stack_set_from_env!(vars, "STY");
         env_stack_set_from_env!(vars, "TERM");
-        terminal_init(&vars, STDIN_FILENO).input_queue
+        terminal_init(&vars, unsafe { std::os::fd::BorrowedFd::borrow_raw(STDIN_FILENO) }).input_queue
     };
 
     setup_and_process_keys(&mut streams, continuous_mode, verbose, input_queue)
