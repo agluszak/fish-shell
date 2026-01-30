@@ -153,8 +153,8 @@ fn sigaction(sig: i32, act: &libc::sigaction, oact: *mut libc::sigaction) -> lib
 
 fn set_interactive_handlers() {
     let signal_handler: usize = fish_signal_handler as *const () as usize;
-    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
-    let mut oact: libc::sigaction = unsafe { std::mem::zeroed() };
+    let mut act: libc::sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
+    let mut oact: libc::sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
     act.sa_flags = 0;
     oact.sa_flags = 0;
     unsafe { libc::sigemptyset(&mut act.sa_mask) };
@@ -201,7 +201,7 @@ pub fn signal_set_handlers(interactive: bool) {
 
     use libc::SIG_IGN;
     let nullptr = std::ptr::null_mut();
-    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    let mut act: libc::sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
 
     act.sa_flags = 0;
     unsafe { libc::sigemptyset(&mut act.sa_mask) };
@@ -258,7 +258,7 @@ pub fn signal_set_handlers_once(interactive: bool) {
 /// Mark that a signal is being handled.
 pub fn signal_handle(sig: Signal) {
     let sig = sig.code();
-    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    let mut act: libc::sigaction = unsafe { MaybeUninit::zeroed().assume_init() };
 
     // These should always be handled.
     if sig == libc::SIGINT
