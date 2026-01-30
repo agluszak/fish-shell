@@ -4891,13 +4891,13 @@ fn term_steal(copy_modes: bool) {
 
 // Ensure that fish owns the terminal, possibly waiting. If we cannot acquire the terminal, then
 // report an error and exit.
-fn acquire_tty_or_exit(shell_pgid: libc::pid_t) {
+fn acquire_tty_or_exit(shell_pgid: Pid) {
     assert_is_main_thread();
 
     // Check if we are in control of the terminal, so that we don't do semi-expensive things like
     // reset signal handlers unless we really have to, which we often don't.
     // Common case.
-    let mut owner = tcgetpgrp(stdin_fd()).map(|p| p.as_raw()).unwrap_or(-1);
+    let mut owner = tcgetpgrp(stdin_fd()).unwrap_or(Pid::from_raw(-1));
     if owner == shell_pgid {
         return;
     }
@@ -4905,8 +4905,8 @@ fn acquire_tty_or_exit(shell_pgid: libc::pid_t) {
     // In some strange cases the tty may be come preassigned to fish's pid, but not its pgroup.
     // In that case we simply attempt to claim our own pgroup.
     // See #7388.
-    if owner == getpid() {
-        let _ = setpgid(Pid::from_raw(owner), Pid::from_raw(owner));
+    if owner == Pid::from_raw(getpid()) {
+        let _ = setpgid(owner, owner);
         return;
     }
 
@@ -4929,19 +4929,19 @@ fn acquire_tty_or_exit(shell_pgid: libc::pid_t) {
     // harder, because it may succeed or block. So we loop for a while, trying those strategies.
     // Eventually we just give up and assume we're orphaend.
     for loop_count in 0.. {
-        owner = tcgetpgrp(stdin_fd()).map(|p| p.as_raw()).unwrap_or(-1);
+        owner = tcgetpgrp(stdin_fd()).unwrap_or(Pid::from_raw(-1));
         // 0 is a valid return code from `tcgetpgrp()` under at least FreeBSD and testing
         // indicates that a subsequent call to `tcsetpgrp()` will succeed. 0 is the
         // pid of the top-level kernel process, so I'm not sure if this means ownership
         // of the terminal has gone back to the kernel (i.e. it's not owned) or if it is
         // just an "invalid" pid for all intents and purposes.
-        if owner == 0 {
-            let _ = tcsetpgrp(stdin_fd(), Pid::from_raw(shell_pgid));
+        if owner == Pid::from_raw(0) {
+            let _ = tcsetpgrp(stdin_fd(), shell_pgid);
             // Since we expect the above to work, call `tcgetpgrp()` immediately to
             // avoid a second pass through this loop.
-            owner = tcgetpgrp(stdin_fd()).map(|p| p.as_raw()).unwrap_or(-1);
+            owner = tcgetpgrp(stdin_fd()).unwrap_or(Pid::from_raw(-1));
         }
-        if owner == -1 && errno().0 == ENOTTY {
+        if owner == Pid::from_raw(-1) && errno().0 == ENOTTY {
             if !is_interactive_session() {
                 // It's OK if we're not able to take control of the terminal. We handle
                 // the fallout from this in a few other places.
@@ -4972,7 +4972,7 @@ fn acquire_tty_or_exit(shell_pgid: libc::pid_t) {
             }
 
             // Try stopping us.
-            if killpg(nix::unistd::Pid::from_raw(shell_pgid), Signal::SIGTTIN).is_err() {
+            if killpg(shell_pgid, Signal::SIGTTIN).is_err() {
                 perror("killpg(shell_pgid, SIGTTIN)");
                 exit_without_destructors(1);
             }
@@ -4984,8 +4984,8 @@ fn acquire_tty_or_exit(shell_pgid: libc::pid_t) {
 fn reader_interactive_init() {
     assert_is_main_thread();
 
-    let mut shell_pgid = getpgrp().as_raw();
-    let shell_pid = getpid();
+    let mut shell_pgid = getpgrp();
+    let shell_pid = Pid::from_raw(getpid());
 
     // Ensure interactive signal handling is enabled.
     signal_set_handlers_once(true);
@@ -4995,9 +4995,9 @@ fn reader_interactive_init() {
 
     // If fish has no valid pgroup (possible with firejail, see #5295) or is interactive,
     // ensure it owns the terminal. Also see #5909, #7060.
-    if shell_pgid == 0 || (is_interactive_session() && shell_pgid != shell_pid) {
+    if shell_pgid == Pid::from_raw(0) || (is_interactive_session() && shell_pgid != shell_pid) {
         shell_pgid = shell_pid;
-        if let Err(e) = setpgid(Pid::from_raw(shell_pgid), Pid::from_raw(shell_pgid)) {
+        if let Err(e) = setpgid(shell_pgid, shell_pgid) {
             // If we're session leader setpgid returns EPERM. The other cases where we'd get EPERM
             // don't apply as we passed our own pid.
             //
@@ -5013,7 +5013,7 @@ fn reader_interactive_init() {
         }
 
         // Take control of the terminal
-        if let Err(e) = tcsetpgrp(stdin_fd(), Pid::from_raw(shell_pgid)) {
+        if let Err(e) = tcsetpgrp(stdin_fd(), shell_pgid) {
             flog!(error, wgettext!("Failed to take control of the terminal"));
             flog!(error, format!("tcsetpgrp: {}", e));
             exit_without_destructors(1);
@@ -6312,15 +6312,14 @@ fn get_ctermid_path() -> Option<PathBuf> {
 
 /// Return true if we believe ourselves to be orphaned. loop_count is how many times we've tried to
 /// stop ourselves via SIGGTIN.
-fn check_for_orphaned_process(loop_count: usize, shell_pgid: libc::pid_t) -> bool {
+fn check_for_orphaned_process(loop_count: usize, shell_pgid: Pid) -> bool {
     let mut we_think_we_are_orphaned = false;
     // Try kill-0'ing the process whose pid corresponds to our process group ID. It's possible this
     // will fail because we don't have permission to signal it. But more likely it will fail because
     // it no longer exists, and we are orphaned.
     if loop_count % 64 == 0 {
         // Use nix::sys::signal::kill with None signal (equivalent to kill(pid, 0))
-        let pid = Pid::from_raw(shell_pgid);
-        if let Err(nix::errno::Errno::ESRCH) = kill(pid, None) {
+        if let Err(nix::errno::Errno::ESRCH) = kill(shell_pgid, None) {
             we_think_we_are_orphaned = true;
         }
     }
