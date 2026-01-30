@@ -145,12 +145,13 @@ use std::{
     cmp,
     ffi::{CStr, OsStr},
     fs::OpenOptions,
-    io::BufReader,
+    io::{BufReader, Read},
     mem::MaybeUninit,
     num::NonZeroUsize,
     ops::{ControlFlow, Range},
-    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+    os::fd::{AsRawFd, BorrowedFd, RawFd},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc, LazyLock, Mutex, MutexGuard, OnceLock,
@@ -6249,6 +6250,22 @@ fn command_ends_history_search(c: ReadlineCmd) -> bool {
     )
 }
 
+/// Get the controlling terminal path using ctermid.
+/// Returns None if ctermid fails.
+fn get_ctermid_path() -> Option<PathBuf> {
+    unsafe extern "C" {
+        unsafe fn ctermid(buf: *mut c_char) -> *mut c_char;
+    }
+    let tty = unsafe { ctermid(std::ptr::null_mut()) };
+    if tty.is_null() {
+        return None;
+    }
+    // Safety: ctermid returns a valid null-terminated string or NULL
+    let tty_cstr = unsafe { CStr::from_ptr(tty) };
+    let tty_osstr = OsStr::from_bytes(tty_cstr.to_bytes());
+    Some(PathBuf::from(tty_osstr))
+}
+
 /// Return true if we believe ourselves to be orphaned. loop_count is how many times we've tried to
 /// stop ourselves via SIGGTIN.
 fn check_for_orphaned_process(loop_count: usize, shell_pgid: libc::pid_t) -> bool {
@@ -6267,38 +6284,31 @@ fn check_for_orphaned_process(loop_count: usize, shell_pgid: libc::pid_t) -> boo
     // Try reading from the tty; if we get EIO we are orphaned. This is sort of bad because it
     // may block.
     if !we_think_we_are_orphaned && loop_count % 128 == 0 {
-        unsafe extern "C" {
-            unsafe fn ctermid(buf: *mut c_char) -> *mut c_char;
-        }
-        let tty = unsafe { ctermid(std::ptr::null_mut()) };
-        if tty.is_null() {
+        let Some(tty_path) = get_ctermid_path() else {
             perror("ctermid");
             exit_without_destructors(1);
-        }
+        };
 
         // Open the tty. Presumably this is stdin, but maybe not?
-        let tty_fd = {
-            let tty_path = unsafe { CStr::from_ptr(tty) };
-            let tty_osstr = OsStr::from_bytes(tty_path.to_bytes());
-            match OpenOptions::new()
-                .read(true)
-                .custom_flags(O_NONBLOCK)
-                .open(tty_osstr)
-            {
-                Ok(file) => unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) },
-                Err(_) => {
-                    perror("open");
-                    exit_without_destructors(1);
-                }
+        let mut tty_file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NONBLOCK)
+            .open(&tty_path)
+        {
+            Ok(file) => file,
+            Err(_) => {
+                perror("open");
+                exit_without_destructors(1);
             }
         };
 
         // Try reading from the tty; if we get EIO we are orphaned.
         let mut tmp = [0u8; 1];
-        // Use nix::unistd::read which returns Result<usize>
-        // OwnedFd implements AsFd, so we can pass it directly
-        if let Err(nix::errno::Errno::EIO) = nix::unistd::read(tty_fd.as_fd(), &mut tmp) {
-            we_think_we_are_orphaned = true;
+        // Use std::io::Read trait - it will return EIO as an io::Error
+        if let Err(e) = tty_file.read(&mut tmp) {
+            if e.raw_os_error() == Some(libc::EIO) {
+                we_think_we_are_orphaned = true;
+            }
         }
     }
 
