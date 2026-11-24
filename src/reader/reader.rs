@@ -1067,7 +1067,8 @@ pub fn restore_term_mode() {
         return;
     }
     if let Some(modes) = get_terminal_mode_on_startup() {
-        unsafe { libc::tcsetattr(STDIN_FILENO, libc::TCSANOW, modes) };
+        let modes = Termios::from(*modes);
+        let _ = tcsetattr(STDIN_FD, SetArg::TCSANOW, &modes);
     }
 }
 
