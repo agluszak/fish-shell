@@ -27,10 +27,10 @@ use fish_common::{Timepoint, escape, timef};
 use fish_widestring::ToWString;
 use libc::{
     EXIT_SUCCESS, SIG_IGN, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGINT, SIGPIPE, SIGQUIT, SIGSEGV,
-    SIGSYS, SIGTTOU, STDOUT_FILENO, WCONTINUED, WEXITSTATUS, WIFCONTINUED, WIFEXITED, WIFSIGNALED,
-    WIFSTOPPED, WNOHANG, WSTOPSIG, WTERMSIG, WUNTRACED,
+    SIGSYS, SIGTTOU, STDOUT_FILENO,
 };
 use nix::{
+    errno::Errno,
     sys::{
         signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, killpg},
         wait::{WaitPidFlag, WaitStatus, waitpid},
@@ -112,18 +112,27 @@ pub fn clock_ticks_to_seconds(ticks: ClockTicks) -> f64 {
 pub type JobGroupRef = Arc<JobGroup>;
 
 /// A ProcStatus is a value type that encapsulates logic around exited vs stopped vs signaled,
-/// etc. It contains an i32 status, or None if the status should be ignored (e.g. for builtin set).
+/// etc. It contains a decoded status, or None if the status should be ignored (e.g. for builtin
+/// set).
 #[derive(Default, Debug, Copy, Clone)]
-pub struct ProcStatus(Option<i32>);
+pub struct ProcStatus(Option<ProcStatusKind>);
+
+/// The decoded state of a process.
+///
+/// We keep the decoded state instead of a raw wait status because nix's `waitpid` already decodes
+/// it for us, and the raw encoding of e.g. a continued child is platform-specific (0xffff on Linux,
+/// 0x137f on macOS, 0x13 on FreeBSD, ...).
+#[derive(Debug, Copy, Clone)]
+enum ProcStatusKind {
+    Exited(u8),
+    Signaled(RawSignal),
+    Stopped(RawSignal),
+    Continued,
+}
 
 impl ProcStatus {
-    fn new(status: Option<i32>) -> Self {
+    fn new(status: Option<ProcStatusKind>) -> Self {
         ProcStatus(status)
-    }
-
-    /// Returns the raw `i32` status value, or 0 if empty.
-    fn status(&self) -> i32 {
-        self.0.unwrap_or(0)
     }
 
     /// Returns the `empty` field.
@@ -134,20 +143,23 @@ impl ProcStatus {
         self.0.is_none()
     }
 
-    /// Encode a return value `ret` and signal `sig` into a status value like waitpid() does.
-    const fn w_exitcode(ret: i32, sig: i32) -> i32 {
-        // This is W_EXITCODE(ret, sig), which libc does not expose on every target.
-        // Either signal and then status, or status and then signal.
-        if WEXITSTATUS(0x007f) == 0x007f {
-            (sig << 8) | ret
-        } else {
-            (ret << 8) | sig
-        }
-    }
-
-    /// Construct from a status returned from a waitpid call.
-    pub fn from_waitpid(status: i32) -> ProcStatus {
-        ProcStatus::new(Some(status))
+    /// Construct from a status returned from a nix waitpid call.
+    pub fn from_waitpid(status: WaitStatus) -> ProcStatus {
+        let kind = match status {
+            WaitStatus::Exited(_, code) => {
+                ProcStatusKind::Exited(u8::try_from(code).expect("Invalid exit code"))
+            }
+            WaitStatus::Signaled(_, sig, _) => ProcStatusKind::Signaled(RawSignal::new(sig as i32)),
+            WaitStatus::Stopped(_, sig) => ProcStatusKind::Stopped(RawSignal::new(sig as i32)),
+            WaitStatus::Continued(_) => ProcStatusKind::Continued,
+            WaitStatus::StillAlive => return ProcStatus::empty(),
+            // fish does not ptrace its children; treat these as no status change.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            WaitStatus::PtraceEvent(_, _, _) | WaitStatus::PtraceSyscall(_) => {
+                return ProcStatus::empty();
+            }
+        };
+        ProcStatus::new(Some(kind))
     }
 
     /// Construct directly from an exit code.
@@ -157,22 +169,13 @@ impl ProcStatus {
             "trying to create proc_status_t from failed waitid()/waitpid() call \
             or invalid builtin exit code!"
         );
-
-        const {
-            let _zerocode = ProcStatus::w_exitcode(0, 0);
-            assert!(
-                WIFEXITED(_zerocode),
-                "Synthetic exit status not reported as exited"
-            );
-        }
-
         assert!(ret < 256);
-        ProcStatus::new(Some(Self::w_exitcode(ret, 0 /* sig */)))
+        ProcStatus::new(Some(ProcStatusKind::Exited(u8::try_from(ret).unwrap())))
     }
 
     /// Construct directly from a signal.
     pub fn from_signal(signal: RawSignal) -> ProcStatus {
-        ProcStatus::new(Some(Self::w_exitcode(0 /* ret */, signal.code())))
+        ProcStatus::new(Some(ProcStatusKind::Signaled(signal)))
     }
 
     /// Construct an empty status_t (e.g. `set foo bar`).
@@ -182,39 +185,47 @@ impl ProcStatus {
 
     /// Return if we are stopped (as in SIGSTOP).
     pub fn stopped(&self) -> bool {
-        WIFSTOPPED(self.status()) && (!cfg!(target_os = "netbsd") || !self.continued())
+        // On NetBSD a continued status may also be reported as stopped; prefer continued.
+        matches!(self.0, Some(ProcStatusKind::Stopped(_)))
+            && (!cfg!(target_os = "netbsd") || !self.continued())
     }
 
     /// Return if we are continued (as in SIGCONT).
     pub fn continued(&self) -> bool {
-        WIFCONTINUED(self.status())
+        matches!(self.0, Some(ProcStatusKind::Continued))
     }
 
     /// Return if we exited normally (not a signal).
     pub fn normal_exited(&self) -> bool {
-        WIFEXITED(self.status())
+        matches!(self.0, Some(ProcStatusKind::Exited(_)))
     }
 
     /// Return if we exited because of a signal.
     pub fn signal_exited(&self) -> bool {
-        WIFSIGNALED(self.status())
+        matches!(self.0, Some(ProcStatusKind::Signaled(_)))
     }
 
     pub fn stop_signal(&self) -> libc::c_int {
-        assert!(self.stopped(), "Process is not signal stopped");
-        WSTOPSIG(self.status())
+        match self.0 {
+            Some(ProcStatusKind::Stopped(sig)) => sig.code(),
+            _ => panic!("Process is not signal stopped"),
+        }
     }
 
     /// Return the signal code, given that we signal exited.
     pub fn signal_code(&self) -> libc::c_int {
-        assert!(self.signal_exited(), "Process is not signal exited");
-        WTERMSIG(self.status())
+        match self.0 {
+            Some(ProcStatusKind::Signaled(sig)) => sig.code(),
+            _ => panic!("Process is not signal exited"),
+        }
     }
 
     /// Return the exit code, given that we normal exited.
     pub fn exit_code(&self) -> u8 {
-        assert!(self.normal_exited(), "Process is not normal exited");
-        u8::try_from(WEXITSTATUS(self.status())).unwrap()
+        match self.0 {
+            Some(ProcStatusKind::Exited(code)) => code,
+            _ => panic!("Process is not normal exited"),
+        }
     }
 
     /// Return if this status represents success.
@@ -1249,22 +1260,29 @@ fn process_mark_finished_children(parser: &mut Parser, block_ok: bool, block_io:
             }
 
             // Ok, we are reapable. Run waitpid()!
-            let mut statusv: libc::c_int = -1;
-            let pid = unsafe {
-                libc::waitpid(
-                    proc.pid().unwrap().as_pid_t(),
-                    &mut statusv,
-                    WNOHANG | WUNTRACED | WCONTINUED,
-                )
+            let wait_status = match waitpid(
+                proc.pid().unwrap().as_nullable_pid(),
+                Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
+            ) {
+                Ok(status) => status,
+                // The child may already have been reaped (e.g. by a SIGCHLD handler).
+                Err(Errno::ECHILD) => continue,
+                Err(_) => continue,
             };
-            if pid == 0 {
+            if matches!(wait_status, WaitStatus::StillAlive) {
                 continue;
             }
-            let pid = Pid::new(pid);
-            assert_eq!(pid, proc.pid().unwrap(), "Unexpected waitpid() return");
+            let waited_pid = wait_status
+                .pid()
+                .expect("waitpid returned a status without a pid");
+            assert_eq!(
+                waited_pid.as_raw(),
+                proc.pid().unwrap().get(),
+                "Unexpected waitpid() return"
+            );
 
             // The process has stopped or exited! Update its status.
-            let status = ProcStatus::from_waitpid(statusv);
+            let status = ProcStatus::from_waitpid(wait_status);
             handle_child_status(j, proc, status);
             if status.stopped() {
                 j.group().set_is_foreground(false);
@@ -1277,7 +1295,7 @@ fn process_mark_finished_children(parser: &mut Parser, block_ok: bool, block_io:
                     proc_reap_external,
                     "Reaped external process '%s' (pid %d, status %d)",
                     proc.argv0().unwrap(),
-                    pid,
+                    waited_pid.as_raw(),
                     proc.status().status_value()
                 );
 
@@ -1288,7 +1306,7 @@ fn process_mark_finished_children(parser: &mut Parser, block_ok: bool, block_io:
                     proc_reap_external,
                     "External process '%s' (pid %d, %s)",
                     proc.argv0().unwrap(),
-                    proc.pid().unwrap(),
+                    waited_pid.as_raw(),
                     if proc.status().stopped() {
                         "stopped"
                     } else {
@@ -1643,3 +1661,47 @@ pub static HAVE_PROC_STAT: LazyLock<bool> =
 
 /// The signals that signify crashes to us.
 const CRASHSIGNALS: [libc::c_int; 6] = [SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGSYS];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::unistd::Pid;
+
+    #[test]
+    fn test_proc_status_from_wait_status() {
+        let pid = Pid::from_raw(42);
+
+        let exited = ProcStatus::from_waitpid(WaitStatus::Exited(pid, 7));
+        assert!(exited.normal_exited());
+        assert_eq!(exited.exit_code(), 7);
+        assert!(!exited.is_success());
+        assert_eq!(exited.status_value(), 7);
+        assert!(ProcStatus::from_exit_code(0).is_success());
+
+        let signaled = ProcStatus::from_waitpid(WaitStatus::Signaled(pid, Signal::SIGTERM, false));
+        assert!(signaled.signal_exited());
+        assert_eq!(signaled.signal_code(), Signal::SIGTERM as i32);
+        assert_eq!(signaled.status_value(), 128 + Signal::SIGTERM as i32);
+
+        let stopped = ProcStatus::from_waitpid(WaitStatus::Stopped(pid, Signal::SIGTSTP));
+        assert!(stopped.stopped());
+        assert_eq!(stopped.stop_signal(), Signal::SIGTSTP as i32);
+        assert_eq!(stopped.status_value(), 128 + Signal::SIGTSTP as i32);
+
+        let continued = ProcStatus::from_waitpid(WaitStatus::Continued(pid));
+        assert!(continued.continued());
+        assert!(!continued.stopped());
+        assert!(!continued.normal_exited());
+        assert!(!continued.signal_exited());
+
+        assert!(ProcStatus::from_waitpid(WaitStatus::StillAlive).is_empty());
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let ptrace = ProcStatus::from_waitpid(WaitStatus::PtraceEvent(pid, Signal::SIGTRAP, 1));
+            assert!(ptrace.is_empty());
+            let ptrace = ProcStatus::from_waitpid(WaitStatus::PtraceSyscall(pid));
+            assert!(ptrace.is_empty());
+        }
+    }
+}
