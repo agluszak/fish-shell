@@ -9,7 +9,7 @@ use crate::wutil::fstat;
 use fish_common::exit_without_destructors;
 use libc::{O_RDONLY, pid_t};
 use nix::errno::Errno;
-use nix::unistd::{Pid, getpgid, getpid, setpgid};
+use nix::unistd::{Pid, getpgid, getpid, setpgid, tcgetpgrp, tcsetpgrp};
 use std::ffi::CStr;
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
@@ -164,10 +164,10 @@ pub fn child_setup_process(
             return err;
         }
     }
-    if claim_tty_from
-        // tcgetpgrp() can return -1 but pid.get() cannot, so cast the latter to the former
-        .is_some_and(|pid| unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) } == pid.get() as i32)
-    {
+    if claim_tty_from.is_some_and(|pid| {
+        tcgetpgrp(unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) })
+            == Ok(Pid::from_raw(pid.get() as i32))
+    }) {
         // Assign the terminal within the child to avoid the well-known race between tcsetgrp() in
         // the parent and the child executing. We are not interested in error handling here, except
         // we try to avoid this for non-terminals; in particular pipelines often make non-terminal
@@ -180,8 +180,11 @@ pub fn child_setup_process(
         unsafe {
             libc::signal(libc::SIGTTIN, libc::SIG_IGN);
             libc::signal(libc::SIGTTOU, libc::SIG_IGN);
-            _ = libc::tcsetpgrp(libc::STDIN_FILENO, getpid().as_raw());
         }
+        _ = tcsetpgrp(
+            unsafe { BorrowedFd::borrow_raw(libc::STDIN_FILENO) },
+            getpid(),
+        );
     }
     if let Some(sigmask) = sigmask {
         unsafe { libc::sigprocmask(libc::SIG_SETMASK, sigmask, std::ptr::null_mut()) };
