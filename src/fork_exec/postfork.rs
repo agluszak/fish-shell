@@ -9,7 +9,7 @@ use crate::wutil::fstat;
 use fish_common::exit_without_destructors;
 use libc::{O_RDONLY, pid_t};
 use nix::errno::Errno;
-use nix::unistd::getpid;
+use nix::unistd::{Pid, getpgid, getpid, setpgid};
 use std::ffi::CStr;
 use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
@@ -48,7 +48,10 @@ pub(crate) fn report_setpgid_error(
     command: &CStr,
     argv0: &CStr,
 ) {
-    let cur_group = unsafe { libc::getpgid(pid) };
+    // getpgid returns -1 on failure, matching the old raw libc call's diagnostic value.
+    let cur_group = getpgid(Some(Pid::from_raw(pid)))
+        .map(|pgid| pgid.as_raw())
+        .unwrap_or(-1);
 
     flog_safe!(
         warning,
@@ -93,10 +96,10 @@ pub fn execute_setpgid(pid: libc::pid_t, pgroup: libc::pid_t, is_parent: bool) -
     // TODO: stop looping.
     let mut eperm_count = 0;
     loop {
-        if unsafe { libc::setpgid(pid, pgroup) } == 0 {
-            return Ok(());
-        }
-        let err = Errno::last();
+        let err = match setpgid(Pid::from_raw(pid), Pid::from_raw(pgroup)) {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
         assert_ne!(err, Errno::EINTR);
         if err == Errno::EACCES && is_parent {
             // We are the parent process and our child has called exec().
@@ -534,7 +537,8 @@ fn get_interpreter<'a>(command: &CStr, buffer: &'a mut [u8]) -> Option<&'a CStr>
 
 #[cfg(test)]
 mod tests {
-    use super::get_interpreter;
+    use super::{execute_setpgid, get_interpreter};
+    use nix::unistd::getpgrp;
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
 
@@ -547,5 +551,14 @@ mod tests {
         let mut buffer = [0u8; 64];
 
         assert!(get_interpreter(command.as_c_str(), &mut buffer).is_none());
+    }
+
+    #[test]
+    fn test_execute_setpgid() {
+        let pgrp = getpgrp().as_raw();
+        // Moving ourselves into our current process group is a no-op that must succeed.
+        assert!(execute_setpgid(0, pgrp, false).is_ok());
+        // A process that does not exist cannot be moved.
+        assert!(execute_setpgid(i32::MAX, pgrp, false).is_err());
     }
 }
