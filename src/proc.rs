@@ -35,7 +35,7 @@ use nix::{
         signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, killpg},
         wait::{WaitPidFlag, WaitStatus, waitpid},
     },
-    unistd::{Pid as NullablePid, SysconfVar, getpgrp, sysconf},
+    unistd::{Pid as NullablePid, SysconfVar, getpgrp, getpid, sysconf},
 };
 use std::{
     cell::{Cell, Ref, RefCell, RefMut},
@@ -1087,7 +1087,7 @@ pub fn proc_init() {
 }
 
 /// Set the status of `proc` to `status`.
-fn handle_child_status(job: &Job, proc: &Process, status: ProcStatus) {
+fn handle_child_status(job: &Job, proc: &Process, status: ProcStatus) -> nix::Result<()> {
     proc.status.set(status);
     if status.stopped() {
         proc.stopped.store(true);
@@ -1114,13 +1114,15 @@ fn handle_child_status(job: &Job, proc: &Process, status: ProcStatus) {
                 let act =
                     SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()).into();
 
+                // Restore the default action before re-delivering the signal to ourselves.
                 unsafe {
                     libc::sigaction(sig, &act, std::ptr::null_mut());
-                    libc::kill(libc::getpid(), sig);
                 }
+                kill(getpid(), Signal::try_from(sig)?)?;
             }
         }
     }
+    Ok(())
 }
 
 /// Wait for any process finishing, or receipt of a signal.
@@ -1283,7 +1285,8 @@ fn process_mark_finished_children(parser: &mut Parser, block_ok: bool, block_io:
 
             // The process has stopped or exited! Update its status.
             let status = ProcStatus::from_waitpid(wait_status);
-            handle_child_status(j, proc, status);
+            // Failures here are limited to converting a signal we already know is valid.
+            let _ = handle_child_status(j, proc, status);
             if status.stopped() {
                 j.group().set_is_foreground(false);
             }
@@ -1350,7 +1353,7 @@ fn process_mark_finished_children(parser: &mut Parser, block_ok: bool, block_io:
 
             // The process gets the status from its internal proc.
             let status = internal_proc.get_status();
-            handle_child_status(j, proc, status);
+            let _ = handle_child_status(j, proc, status);
             flogf!(
                 proc_reap_internal,
                 "Reaped internal process '%s' (id %u, status %d)",
