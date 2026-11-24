@@ -150,7 +150,7 @@ use std::{
     io::BufReader,
     num::NonZeroUsize,
     ops::{ControlFlow, DerefMut, Range},
-    os::fd::{AsRawFd as _, BorrowedFd, RawFd},
+    os::fd::{BorrowedFd, RawFd},
     pin::Pin,
     sync::{
         Arc, LazyLock, Mutex, MutexGuard, OnceLock,
@@ -226,11 +226,16 @@ fn redirect_tty_after_sighup() {
     let Ok(devnull) = OpenOptions::new().read(true).write(true).open("/dev/null") else {
         return;
     };
-    let fd = devnull.as_raw_fd();
-    for stdfd in [STDIN_FD, STDOUT_FD, STDERR_FD] {
-        if matches!(tcgetattr(stdfd), Err(nix::Error::EIO | nix::Error::ENOTTY)) {
-            unsafe { libc::dup2(fd, stdfd.as_raw_fd()) };
-        }
+    let tty_gone = |stdfd| matches!(tcgetattr(stdfd), Err(nix::Error::EIO | nix::Error::ENOTTY));
+    // The original ignored errors from dup2; preserve that behavior.
+    if tty_gone(STDIN_FD) {
+        let _ = nix::unistd::dup2_stdin(&devnull);
+    }
+    if tty_gone(STDOUT_FD) {
+        let _ = nix::unistd::dup2_stdout(&devnull);
+    }
+    if tty_gone(STDERR_FD) {
+        let _ = nix::unistd::dup2_stderr(&devnull);
     }
 }
 
