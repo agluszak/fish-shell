@@ -2,9 +2,9 @@ use crate::{flog::flog, prelude::*, signal::signal_check_cancel, wutil::perror_n
 use cfg_if::cfg_if;
 use fish_util::perror;
 use fish_widestring::wcs2zstring;
-use libc::{F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, O_NONBLOCK, c_int};
+use libc::c_int;
 use nix::errno::Errno;
-use nix::fcntl::{FcntlArg, OFlag};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag};
 use std::{
     ffi::CStr,
     fs::File,
@@ -12,7 +12,7 @@ use std::{
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
     os::{
-        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+        fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
         unix::prelude::*,
     },
 };
@@ -117,22 +117,26 @@ pub fn heightenize_fd(fd: OwnedFd, input_has_cloexec: bool) -> nix::Result<Owned
 
 /// Sets CLOEXEC on a given fd according to the value of `should_set`.
 pub fn set_cloexec(fd: RawFd, should_set: bool /* = true */) -> c_int {
-    // Note we don't want to overwrite existing flags like O_NONBLOCK which may be set. So fetch the
+    // Note we don't want to overwrite existing flags which may be set. So fetch the
     // existing flags and modify them.
-    let flags = unsafe { libc::fcntl(fd, F_GETFD, 0) };
-    if flags < 0 {
-        return -1;
-    }
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let flags = match nix::fcntl::fcntl(&fd, FcntlArg::F_GETFD) {
+        Ok(flags) => FdFlag::from_bits_retain(flags),
+        Err(_) => return -1,
+    };
     let mut new_flags = flags;
     if should_set {
-        new_flags |= FD_CLOEXEC;
+        new_flags.insert(FdFlag::FD_CLOEXEC);
     } else {
-        new_flags &= !FD_CLOEXEC;
+        new_flags.remove(FdFlag::FD_CLOEXEC);
     }
     if flags == new_flags {
         0
     } else {
-        unsafe { libc::fcntl(fd, F_SETFD, new_flags) }
+        match nix::fcntl::fcntl(&fd, FcntlArg::F_SETFD(new_flags)) {
+            Ok(_) => 0,
+            Err(_) => -1,
+        }
     }
 }
 
@@ -227,26 +231,20 @@ pub fn exec_close(fd: RawFd) {
 
 /// Mark an fd as nonblocking
 pub fn make_fd_nonblocking(fd: RawFd) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, F_GETFL, 0) };
-    let nonblocking = (flags & O_NONBLOCK) == O_NONBLOCK;
-    if !nonblocking {
-        match unsafe { libc::fcntl(fd, F_SETFL, flags | O_NONBLOCK) } {
-            -1 => return Err(io::Error::last_os_error()),
-            _ => return Ok(()),
-        };
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let flags = OFlag::from_bits_retain(nix::fcntl::fcntl(&fd, FcntlArg::F_GETFL)?);
+    if !flags.contains(OFlag::O_NONBLOCK) {
+        nix::fcntl::fcntl(&fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
     }
     Ok(())
 }
 
 /// Mark an fd as blocking
 pub fn make_fd_blocking(fd: RawFd) -> Result<(), io::Error> {
-    let flags = unsafe { libc::fcntl(fd, F_GETFL, 0) };
-    let nonblocking = (flags & O_NONBLOCK) == O_NONBLOCK;
-    if nonblocking {
-        match unsafe { libc::fcntl(fd, F_SETFL, flags & !O_NONBLOCK) } {
-            -1 => return Err(io::Error::last_os_error()),
-            _ => return Ok(()),
-        };
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let flags = OFlag::from_bits_retain(nix::fcntl::fcntl(&fd, FcntlArg::F_GETFL)?);
+    if flags.contains(OFlag::O_NONBLOCK) {
+        nix::fcntl::fcntl(&fd, FcntlArg::F_SETFL(flags & !OFlag::O_NONBLOCK))?;
     }
     Ok(())
 }
@@ -328,7 +326,8 @@ mod tests {
     use super::{BorrowedFdFile, FIRST_HIGH_FD, make_autoclose_pipes};
     use crate::tests::prelude::*;
     use libc::FD_CLOEXEC;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use nix::fcntl::FcntlArg;
+    use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _};
 
     #[test]
     #[serial]
@@ -358,10 +357,12 @@ mod tests {
         let borrowed = unsafe { BorrowedFdFile::from_raw_fd(fd) };
         #[allow(clippy::drop_non_drop)]
         drop(borrowed);
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD, 0) };
-        assert!(flags >= 0);
+        assert!(
+            nix::fcntl::fcntl(unsafe { BorrowedFd::borrow_raw(fd) }, FcntlArg::F_GETFD).is_ok()
+        );
         drop(file);
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD, 0) };
-        assert!(flags < 0);
+        assert!(
+            nix::fcntl::fcntl(unsafe { BorrowedFd::borrow_raw(fd) }, FcntlArg::F_GETFD).is_err()
+        );
     }
 }
